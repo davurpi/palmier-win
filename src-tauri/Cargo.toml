@@ -1,6 +1,6 @@
 [package]
 name = "palmier-win"
-version = "0.1.0"
+version = "0.2.0"
 description = "Palmier Win — video editor built for AI (Windows/macOS port of the Palmier Pro concept, FFmpeg engine)"
 authors = ["Synkiria"]
 edition = "2021"
@@ -22,3 +22,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 axum = "0.8"
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+imageproc = "0.25"
+ab_glyph = "0.2"

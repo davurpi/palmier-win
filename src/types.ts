@@ -22,6 +22,31 @@ export interface Clip {
   source_in: number;
   volume: number;
   opacity: number;
+  pos_x: number;
+  pos_y: number;
+  scale: number;
+  speed: number;
+  fade_in: number;
+  fade_out: number;
+  denoise: boolean;
+  brightness: number;
+  contrast: number;
+  saturation: number;
+}
+
+export interface ClipProps {
+  volume?: number;
+  opacity?: number;
+  pos_x?: number;
+  pos_y?: number;
+  scale?: number;
+  speed?: number;
+  fade_in?: number;
+  fade_out?: number;
+  denoise?: boolean;
+  brightness?: number;
+  contrast?: number;
+  saturation?: number;
 }
 
 export interface Track {

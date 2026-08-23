@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { Clip, ExportProgress, Project } from "./types";
+import type { Clip, ClipProps, ExportProgress, Project } from "./types";
 
 interface EditorState {
   project: Project | null;
@@ -26,8 +26,13 @@ interface EditorState {
   trimClip: (clipId: string, startFrame?: number, endFrame?: number) => Promise<void>;
   splitAtPlayhead: () => Promise<void>;
   removeSelected: () => Promise<void>;
-  setClipProps: (clipId: string, volume?: number, opacity?: number) => Promise<void>;
+  setClipProps: (clipId: string, props: ClipProps) => Promise<void>;
   addTrack: (kind: "video" | "audio") => Promise<void>;
+  undo: () => Promise<void>;
+  redo: () => Promise<void>;
+  applyLayout: (clipIds: string[], layout: string) => Promise<void>;
+  addText: (text: string, fontSize: number, color: string, posY: number) => Promise<void>;
+  removeSilence: (clipId: string) => Promise<void>;
 }
 
 export function findClip(project: Project, clipId: string): Clip | undefined {
@@ -102,16 +107,50 @@ export const useStore = create<EditorState>((set, get) => ({
     set({ selectedClipIds: [] });
     await get().refresh();
   },
-  setClipProps: async (clipId, volume, opacity) => {
-    await invoke("set_clip_properties", {
-      clipId,
-      volume: volume ?? null,
-      opacity: opacity ?? null,
-    });
+  setClipProps: async (clipId, props) => {
+    await invoke("set_clip_properties", { clipId, props });
     await get().refresh();
   },
   addTrack: async (kind) => {
     await invoke("add_track", { kind });
+    await get().refresh();
+  },
+  undo: async () => {
+    try {
+      await invoke("undo");
+      await get().refresh();
+    } catch {
+      /* nothing to undo */
+    }
+  },
+  redo: async () => {
+    try {
+      await invoke("redo");
+      await get().refresh();
+    } catch {
+      /* nothing to redo */
+    }
+  },
+  applyLayout: async (clipIds, layout) => {
+    await invoke("apply_layout", { clipIds, layout });
+    await get().refresh();
+  },
+  addText: async (text, fontSize, color, posY) => {
+    await invoke("add_text", {
+      trackId: null,
+      text,
+      startFrame: Math.round(get().playheadFrame),
+      durationFrames: null,
+      fontSize,
+      color,
+      posX: null,
+      posY,
+    });
+    await get().refresh();
+  },
+  removeSilence: async (clipId) => {
+    await invoke("remove_silence", { clipId, noiseDb: null, minDuration: null });
+    set({ selectedClipIds: [] });
     await get().refresh();
   },
 }));

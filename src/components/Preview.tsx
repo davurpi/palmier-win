@@ -93,11 +93,14 @@ function TrackLayer({ track, zIndex }: { track: Track; zIndex: number }) {
     ? project?.media.find((m) => m.id === clip.media_id)
     : undefined;
 
-  const expectedTime = clip ? clip.source_in + (playheadFrame - clip.start_frame) / fps : 0;
+  const expectedTime = clip
+    ? clip.source_in + ((playheadFrame - clip.start_frame) / fps) * clip.speed
+    : 0;
 
   useEffect(() => {
     const v = videoRef.current;
     if (!v || !clip) return;
+    v.playbackRate = clip.speed;
     if (playing) {
       if (Math.abs(v.currentTime - expectedTime) > 0.2) v.currentTime = expectedTime;
       v.play().catch(() => {});
@@ -105,7 +108,7 @@ function TrackLayer({ track, zIndex }: { track: Track; zIndex: number }) {
       v.pause();
       v.currentTime = expectedTime;
     }
-  }, [playing, clip?.id, media?.id]);
+  }, [playing, clip?.id, media?.id, clip?.speed]);
 
   // Re-sync on scrub while paused.
   useEffect(() => {
@@ -116,10 +119,13 @@ function TrackLayer({ track, zIndex }: { track: Track; zIndex: number }) {
 
   if (!clip || !media) return null;
 
-  const style: React.CSSProperties = {
-    zIndex,
-    opacity: clip.opacity,
-  };
+  // Approximate fades in preview by ramping layer opacity.
+  const tLocal = (playheadFrame - clip.start_frame) / fps;
+  const tEnd = (clip.end_frame - clip.start_frame) / fps;
+  let fadeMul = 1;
+  if (clip.fade_in > 0.01 && tLocal < clip.fade_in) fadeMul = Math.max(0, tLocal / clip.fade_in);
+  if (clip.fade_out > 0.01 && tEnd - tLocal < clip.fade_out)
+    fadeMul = Math.min(fadeMul, Math.max(0, (tEnd - tLocal) / clip.fade_out));
 
   if (track.kind === "audio" || media.kind === "audio") {
     return (
@@ -127,23 +133,55 @@ function TrackLayer({ track, zIndex }: { track: Track; zIndex: number }) {
         ref={videoRef}
         src={convertFileSrc(media.path)}
         style={{ display: "none" }}
-        // volume must be set via effect on some webviews, but attribute works in practice
-        onLoadedMetadata={(e) => (e.currentTarget.volume = Math.min(1, clip.volume))}
+        onLoadedMetadata={(e) =>
+          (e.currentTarget.volume = Math.min(1, clip.volume * fadeMul))
+        }
       />
     );
   }
 
+  // Slot box centered at (pos_x, pos_y) sized scale× the canvas; media letterboxes inside.
+  const wrapStyle: React.CSSProperties = {
+    position: "absolute",
+    left: `${clip.pos_x * 100}%`,
+    top: `${clip.pos_y * 100}%`,
+    width: `${clip.scale * 100}%`,
+    height: `${clip.scale * 100}%`,
+    transform: "translate(-50%, -50%)",
+    zIndex,
+    opacity: clip.opacity * fadeMul,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    pointerEvents: "none",
+  };
+  const mediaStyle: React.CSSProperties = {
+    maxWidth: "100%",
+    maxHeight: "100%",
+    width: "100%",
+    height: "100%",
+    objectFit: "contain",
+    filter: `brightness(${1 + clip.brightness}) contrast(${clip.contrast}) saturate(${clip.saturation})`,
+  };
+
   if (media.kind === "image") {
-    return <img className="layer" src={convertFileSrc(media.path)} style={style} alt="" />;
+    return (
+      <div style={wrapStyle}>
+        <img src={convertFileSrc(media.path)} style={mediaStyle} alt="" />
+      </div>
+    );
   }
 
   return (
-    <video
-      ref={videoRef}
-      className="layer"
-      src={convertFileSrc(media.path)}
-      style={style}
-      onLoadedMetadata={(e) => (e.currentTarget.volume = Math.min(1, clip.volume))}
-    />
+    <div style={wrapStyle}>
+      <video
+        ref={videoRef}
+        src={convertFileSrc(media.path)}
+        style={mediaStyle}
+        onLoadedMetadata={(e) =>
+          (e.currentTarget.volume = Math.min(1, clip.volume * fadeMul))
+        }
+      />
+    </div>
   );
 }

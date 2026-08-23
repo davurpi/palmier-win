@@ -1,4 +1,4 @@
-use crate::model::{MediaAsset, MediaKind, Project, TrackKind};
+use crate::model::{Clip, MediaAsset, MediaKind, Project, TrackKind};
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -113,6 +113,93 @@ pub async fn thumbnail(asset: &MediaAsset, cache_dir: &Path) -> Result<PathBuf> 
     Ok(out_path)
 }
 
+/// Silence ranges of a source file segment, in SOURCE seconds.
+pub async fn detect_silence(
+    path: &str,
+    from_sec: f64,
+    dur_sec: f64,
+    noise_db: f64,
+    min_duration: f64,
+) -> Result<Vec<(f64, f64)>> {
+    let out = Command::new("ffmpeg")
+        .args([
+            "-v", "info",
+            "-ss", &format!("{from_sec:.4}"),
+            "-t", &format!("{dur_sec:.4}"),
+            "-i", path,
+            "-af", &format!("silencedetect=noise={noise_db}dB:d={min_duration}"),
+            "-f", "null", "-",
+        ])
+        .output()
+        .await
+        .context("ffmpeg not found")?;
+    let log = String::from_utf8_lossy(&out.stderr);
+    let mut ranges = vec![];
+    let mut start: Option<f64> = None;
+    for line in log.lines() {
+        if let Some(p) = line.find("silence_start: ") {
+            start = line[p + 15..].split_whitespace().next().and_then(|s| s.parse().ok());
+        } else if let Some(p) = line.find("silence_end: ") {
+            if let (Some(s), Some(e)) = (
+                start.take(),
+                line[p + 13..].split_whitespace().next().and_then(|s| s.parse::<f64>().ok()),
+            ) {
+                // Offsets are relative to the segment; shift to absolute source time.
+                ranges.push((from_sec + s, from_sec + e));
+            }
+        }
+    }
+    // Silence running to the end of the segment never gets a silence_end line.
+    if let Some(s) = start {
+        ranges.push((from_sec + s, from_sec + dur_sec));
+    }
+    Ok(ranges)
+}
+
+/// atempo only accepts 0.5–100 per instance; chain for slower rates.
+fn atempo_chain(speed: f32) -> String {
+    let mut s = speed as f64;
+    let mut parts = vec![];
+    while s < 0.5 {
+        parts.push("atempo=0.5".to_string());
+        s /= 0.5;
+    }
+    parts.push(format!("atempo={s:.4}"));
+    parts.join(",")
+}
+
+fn eq_filter(c: &Clip) -> String {
+    if c.brightness.abs() < 0.001 && (c.contrast - 1.0).abs() < 0.001 && (c.saturation - 1.0).abs() < 0.001 {
+        String::new()
+    } else {
+        format!(
+            "eq=brightness={}:contrast={}:saturation={},",
+            c.brightness, c.contrast, c.saturation
+        )
+    }
+}
+
+fn audio_chain(c: &Clip, dur: f64, start: f64) -> String {
+    let mut f = String::new();
+    if (c.speed - 1.0).abs() > 0.001 {
+        f.push_str(&atempo_chain(c.speed));
+        f.push(',');
+    }
+    f.push_str(&format!("atrim=0:{dur:.4},asetpts=PTS-STARTPTS,"));
+    if c.denoise {
+        f.push_str("afftdn=nr=12,");
+    }
+    f.push_str(&format!("volume={}", c.volume));
+    if c.fade_in > 0.01 {
+        f.push_str(&format!(",afade=t=in:st=0:d={}", c.fade_in));
+    }
+    if c.fade_out > 0.01 {
+        f.push_str(&format!(",afade=t=out:st={}:d={}", (dur - c.fade_out as f64).max(0.0), c.fade_out));
+    }
+    f.push_str(&format!(",adelay={}:all=1", (start * 1000.0).round() as i64));
+    f
+}
+
 #[derive(Serialize, Clone)]
 pub struct ExportProgress {
     pub percent: f64,
@@ -123,8 +210,9 @@ pub struct ExportProgress {
 /// Build and run the FFmpeg command that renders the whole timeline.
 ///
 /// Every clip becomes its own input (with -ss/-t so FFmpeg only decodes what is
-/// used). Video tracks are composited bottom-to-top with overlay; audio is mixed
-/// with amix. This mirrors what the timeline preview shows.
+/// used). Per-clip chain: speed → scale into its slot box → color eq → alpha
+/// fades → shift to timeline position. Video tracks composite bottom-to-top
+/// with overlay at the clip's normalized center; audio is mixed with amix.
 pub async fn export(
     app: tauri::AppHandle,
     project: Project,
@@ -144,14 +232,15 @@ pub async fn export(
     let mut filter = String::new();
     let mut input_idx = 0usize;
 
-    // (input label registration happens as we walk the clips)
-    struct VClip {
+    struct VLayer {
         label: String,
         start: f64,
         end: f64,
         opacity: f32,
+        pos_x: f32,
+        pos_y: f32,
     }
-    let mut video_layers: Vec<VClip> = vec![]; // ordered bottom-to-top
+    let mut video_layers: Vec<VLayer> = vec![]; // ordered bottom-to-top
     let mut audio_labels: Vec<String> = vec![];
 
     // Iterate video tracks bottom-to-top so the top track (index 0) is overlaid last.
@@ -164,40 +253,76 @@ pub async fn export(
             let start = clip.start_frame as f64 / fps;
             let end = clip.end_frame as f64 / fps;
             let dur = end - start;
+            let src_dur = dur * clip.speed as f64;
+            let box_w = ((w as f32 * clip.scale) as u32).max(2) & !1;
+            let box_h = ((h as f32 * clip.scale) as u32).max(2) & !1;
 
             match (track.kind, media.kind) {
                 (TrackKind::Video, MediaKind::Image) => {
                     args.extend(["-loop".into(), "1".into(), "-t".into(), format!("{dur:.4}")]);
                     args.extend(["-i".into(), media.path.clone()]);
                     let lbl = format!("v{input_idx}");
+                    let mut fades = String::new();
+                    if clip.fade_in > 0.01 {
+                        fades.push_str(&format!("fade=t=in:st=0:d={}:alpha=1,", clip.fade_in));
+                    }
+                    if clip.fade_out > 0.01 {
+                        fades.push_str(&format!(
+                            "fade=t=out:st={}:d={}:alpha=1,",
+                            (dur - clip.fade_out as f64).max(0.0),
+                            clip.fade_out
+                        ));
+                    }
                     filter.push_str(&format!(
-                        "[{input_idx}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,\
-                         pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},\
-                         format=yuva420p,setpts=PTS-STARTPTS+{start:.4}/TB[{lbl}];"
+                        "[{input_idx}:v]scale={box_w}:{box_h}:force_original_aspect_ratio=decrease,\
+                         setsar=1,fps={fps},{eq}format=yuva420p,{fades}\
+                         setpts=PTS-STARTPTS+{start:.4}/TB[{lbl}];",
+                        eq = eq_filter(clip),
                     ));
-                    video_layers.push(VClip { label: lbl, start, end, opacity: clip.opacity });
+                    video_layers.push(VLayer {
+                        label: lbl, start, end,
+                        opacity: clip.opacity, pos_x: clip.pos_x, pos_y: clip.pos_y,
+                    });
                     input_idx += 1;
                 }
                 (TrackKind::Video, MediaKind::Video) => {
                     args.extend([
                         "-ss".into(), format!("{:.4}", clip.source_in),
-                        "-t".into(), format!("{dur:.4}"),
+                        "-t".into(), format!("{src_dur:.4}"),
                         "-i".into(), media.path.clone(),
                     ]);
                     let lbl = format!("v{input_idx}");
+                    let speed_f = if (clip.speed - 1.0).abs() > 0.001 {
+                        format!("setpts=(PTS-STARTPTS)/{},", clip.speed)
+                    } else {
+                        String::new()
+                    };
+                    let mut fades = String::new();
+                    if clip.fade_in > 0.01 {
+                        fades.push_str(&format!("fade=t=in:st=0:d={}:alpha=1,", clip.fade_in));
+                    }
+                    if clip.fade_out > 0.01 {
+                        fades.push_str(&format!(
+                            "fade=t=out:st={}:d={}:alpha=1,",
+                            (dur - clip.fade_out as f64).max(0.0),
+                            clip.fade_out
+                        ));
+                    }
                     filter.push_str(&format!(
-                        "[{input_idx}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,\
-                         pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},\
-                         format=yuva420p,setpts=PTS-STARTPTS+{start:.4}/TB[{lbl}];"
+                        "[{input_idx}:v]{speed_f}scale={box_w}:{box_h}:force_original_aspect_ratio=decrease,\
+                         setsar=1,fps={fps},{eq}format=yuva420p,{fades}\
+                         setpts=PTS-STARTPTS+{start:.4}/TB[{lbl}];",
+                        eq = eq_filter(clip),
                     ));
-                    video_layers.push(VClip { label: lbl, start, end, opacity: clip.opacity });
+                    video_layers.push(VLayer {
+                        label: lbl, start, end,
+                        opacity: clip.opacity, pos_x: clip.pos_x, pos_y: clip.pos_y,
+                    });
                     if media.has_audio && clip.volume > 0.0 {
                         let albl = format!("a{input_idx}");
                         filter.push_str(&format!(
-                            "[{input_idx}:a]atrim=0:{dur:.4},asetpts=PTS-STARTPTS,\
-                             volume={vol},adelay={delay}:all=1[{albl}];",
-                            vol = clip.volume,
-                            delay = (start * 1000.0).round() as i64,
+                            "[{input_idx}:a]{}[{albl}];",
+                            audio_chain(clip, dur, start)
                         ));
                         audio_labels.push(albl);
                     }
@@ -206,15 +331,13 @@ pub async fn export(
                 (TrackKind::Audio, _) => {
                     args.extend([
                         "-ss".into(), format!("{:.4}", clip.source_in),
-                        "-t".into(), format!("{dur:.4}"),
+                        "-t".into(), format!("{src_dur:.4}"),
                         "-i".into(), media.path.clone(),
                     ]);
                     let albl = format!("a{input_idx}");
                     filter.push_str(&format!(
-                        "[{input_idx}:a]atrim=0:{dur:.4},asetpts=PTS-STARTPTS,\
-                         volume={vol},adelay={delay}:all=1[{albl}];",
-                        vol = clip.volume,
-                        delay = (start * 1000.0).round() as i64,
+                        "[{input_idx}:a]{}[{albl}];",
+                        audio_chain(clip, dur, start)
                     ));
                     audio_labels.push(albl);
                     input_idx += 1;
@@ -242,8 +365,9 @@ pub async fn export(
         };
         let next = format!("ov{i}");
         filter.push_str(&format!(
-            "[{prev}][{src}]overlay=enable='between(t,{:.4},{:.4})':eof_action=pass[{next}];",
-            l.start, l.end
+            "[{prev}][{src}]overlay=x=main_w*{px}-overlay_w/2:y=main_h*{py}-overlay_h/2:\
+             enable='between(t,{s:.4},{e:.4})':eof_action=pass[{next}];",
+            px = l.pos_x, py = l.pos_y, s = l.start, e = l.end
         ));
         prev = next;
     }

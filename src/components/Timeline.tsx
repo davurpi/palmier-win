@@ -2,6 +2,58 @@ import { useRef, useState } from "react";
 import { useStore } from "../store";
 import type { Clip, Track } from "../types";
 
+function TextDialog({ onClose }: { onClose: () => void }) {
+  const { addText } = useStore();
+  const [text, setText] = useState("");
+  const [size, setSize] = useState(72);
+  const [color, setColor] = useState("#ffffff");
+  const [posY, setPosY] = useState(0.5);
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h2>Add text</h2>
+        <div className="form-row">
+          <label>Text</label>
+          <textarea
+            autoFocus
+            rows={2}
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder="Your title…"
+          />
+        </div>
+        <div className="form-row">
+          <label>Size</label>
+          <input type="number" min={16} max={300} value={size} onChange={(e) => setSize(+e.target.value)} />
+          <label>Color</label>
+          <input type="color" value={color} onChange={(e) => setColor(e.target.value)} />
+        </div>
+        <div className="form-row">
+          <label>Position</label>
+          <select value={posY} onChange={(e) => setPosY(+e.target.value)}>
+            <option value={0.15}>Top</option>
+            <option value={0.5}>Center</option>
+            <option value={0.8}>Lower third</option>
+          </select>
+        </div>
+        <div className="modal-actions">
+          <button onClick={onClose}>Cancel</button>
+          <button
+            className="primary"
+            disabled={!text.trim()}
+            onClick={async () => {
+              await addText(text, size, color, posY);
+              onClose();
+            }}
+          >
+            Add at playhead
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 interface DragState {
   clipId: string;
   mode: "move" | "trim-l" | "trim-r";
@@ -14,10 +66,11 @@ export default function Timeline() {
   const {
     project, pxPerFrame, setZoom, playheadFrame, setPlayhead,
     selectedClipIds, select, addClip, moveClip, trimClip, addTrack,
-    splitAtPlayhead, removeSelected,
+    splitAtPlayhead, removeSelected, undo, redo,
   } = useStore();
   const scrollRef = useRef<HTMLDivElement>(null);
   const [drag, setDrag] = useState<DragState | null>(null);
+  const [textOpen, setTextOpen] = useState(false);
 
   if (!project) return <section className="timeline" />;
   const fps = project.timeline.fps;
@@ -70,8 +123,12 @@ export default function Timeline() {
   return (
     <section className="timeline" onWheel={onWheel}>
       <div className="timeline-toolbar">
+        <button onClick={undo} title="Undo (Ctrl/Cmd+Z)">↩</button>
+        <button onClick={redo} title="Redo (Ctrl/Cmd+Shift+Z)">↪</button>
+        <span className="spacer" />
         <button onClick={() => addTrack("video")}>+ Video track</button>
         <button onClick={() => addTrack("audio")}>+ Audio track</button>
+        <button onClick={() => setTextOpen(true)}>+ Text</button>
         <span className="spacer" />
         <button onClick={splitAtPlayhead} title="Split at playhead (S)">✂ Split</button>
         <button onClick={removeSelected} title="Delete selected (Del)">🗑 Delete</button>
@@ -110,6 +167,7 @@ export default function Timeline() {
           />
         </div>
       </div>
+      {textOpen && <TextDialog onClose={() => setTextOpen(false)} />}
     </section>
   );
 }
@@ -139,8 +197,31 @@ function TrackRow(props: {
     const state: DragState = { clipId: clip.id, mode, startX, deltaFrames: 0, targetTrackId: null };
     setDrag(state);
 
+    // Snap targets: other clips' edges, the playhead and frame 0.
+    const st = useStore.getState();
+    const candidates: number[] = [0, Math.round(st.playheadFrame)];
+    st.project?.timeline.tracks.forEach((t) =>
+      t.clips.forEach((c) => {
+        if (c.id !== clip.id) candidates.push(c.start_frame, c.end_frame);
+      })
+    );
+    const dur = clip.end_frame - clip.start_frame;
+    const snapMove = (raw: number) => {
+      const th = 8 / pxPerFrame;
+      let best = raw;
+      let bestD = th;
+      for (const c of candidates) {
+        const dS = Math.abs(c - (clip.start_frame + raw));
+        if (dS < bestD) { bestD = dS; best = c - clip.start_frame; }
+        const dE = Math.abs(c - (clip.start_frame + raw + dur));
+        if (dE < bestD) { bestD = dE; best = c - clip.start_frame - dur; }
+      }
+      return Math.round(best);
+    };
+
     const onMove = (ev: PointerEvent) => {
-      const deltaFrames = Math.round((ev.clientX - startX) / pxPerFrame);
+      let deltaFrames = Math.round((ev.clientX - startX) / pxPerFrame);
+      if (mode === "move") deltaFrames = snapMove(deltaFrames);
       let targetTrackId: string | null = null;
       if (mode === "move") {
         const lane = document
@@ -155,7 +236,8 @@ function TrackRow(props: {
     const onUp = (ev: PointerEvent) => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
-      const deltaFrames = Math.round((ev.clientX - startX) / pxPerFrame);
+      let deltaFrames = Math.round((ev.clientX - startX) / pxPerFrame);
+      if (mode === "move") deltaFrames = snapMove(deltaFrames);
       setDrag(null);
       if (mode === "move") {
         const lane = document

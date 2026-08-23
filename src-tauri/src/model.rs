@@ -36,6 +36,9 @@ pub enum TrackKind {
     Audio,
 }
 
+fn d_half() -> f32 { 0.5 }
+fn d_one() -> f32 { 1.0 }
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Clip {
     pub id: String,
@@ -47,6 +50,31 @@ pub struct Clip {
     pub source_in: f64,
     pub volume: f32,
     pub opacity: f32,
+    /// Canvas-normalized center position (0..1) and uniform scale (1 = fit canvas).
+    #[serde(default = "d_half")]
+    pub pos_x: f32,
+    #[serde(default = "d_half")]
+    pub pos_y: f32,
+    #[serde(default = "d_one")]
+    pub scale: f32,
+    /// Playback rate: 1 = normal, 2 = double speed. Timeline length stays fixed;
+    /// speed changes how much source is consumed.
+    #[serde(default = "d_one")]
+    pub speed: f32,
+    /// Fade in/out duration in seconds (video alpha + audio).
+    #[serde(default)]
+    pub fade_in: f32,
+    #[serde(default)]
+    pub fade_out: f32,
+    #[serde(default)]
+    pub denoise: bool,
+    /// Color: brightness -1..1 (0 neutral), contrast 0..2 (1), saturation 0..3 (1).
+    #[serde(default)]
+    pub brightness: f32,
+    #[serde(default = "d_one")]
+    pub contrast: f32,
+    #[serde(default = "d_one")]
+    pub saturation: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -185,6 +213,16 @@ impl Project {
             source_in: src_in,
             volume: 1.0,
             opacity: 1.0,
+            pos_x: 0.5,
+            pos_y: 0.5,
+            scale: 1.0,
+            speed: 1.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            denoise: false,
+            brightness: 0.0,
+            contrast: 1.0,
+            saturation: 1.0,
         };
         track.clips.push(clip.clone());
         Ok(clip)
@@ -230,7 +268,8 @@ impl Project {
         if let Some(s) = start_frame {
             let s = s.clamp(0, clip.end_frame - 1);
             // Trimming the head moves source_in so content stays in place.
-            clip.source_in = (clip.source_in + (s - clip.start_frame) as f64 / fps).max(0.0);
+            clip.source_in =
+                (clip.source_in + (s - clip.start_frame) as f64 / fps * clip.speed as f64).max(0.0);
             clip.start_frame = s;
         }
         if let Some(e) = end_frame {
@@ -253,7 +292,8 @@ impl Project {
         let mut right = clip.clone();
         right.id = new_id();
         right.start_frame = at_frame;
-        right.source_in = clip.source_in + (at_frame - clip.start_frame) as f64 / fps;
+        right.source_in =
+            clip.source_in + (at_frame - clip.start_frame) as f64 / fps * clip.speed as f64;
         self.timeline.tracks[ti].clips[ci] = left.clone();
         self.timeline.tracks[ti].clips.push(right.clone());
         Ok(vec![left, right])
@@ -269,22 +309,122 @@ impl Project {
         removed
     }
 
-    pub fn set_clip_properties(
-        &mut self,
-        clip_id: &str,
-        volume: Option<f32>,
-        opacity: Option<f32>,
-    ) -> Result<Clip, String> {
+    pub fn set_clip_properties(&mut self, clip_id: &str, p: ClipProps) -> Result<Clip, String> {
         let (ti, ci) = self
             .find_clip_mut(clip_id)
             .ok_or_else(|| format!("clip {clip_id} not found"))?;
         let clip = &mut self.timeline.tracks[ti].clips[ci];
-        if let Some(v) = volume {
-            clip.volume = v.clamp(0.0, 4.0);
-        }
-        if let Some(o) = opacity {
-            clip.opacity = o.clamp(0.0, 1.0);
-        }
+        if let Some(v) = p.volume { clip.volume = v.clamp(0.0, 4.0); }
+        if let Some(o) = p.opacity { clip.opacity = o.clamp(0.0, 1.0); }
+        if let Some(x) = p.pos_x { clip.pos_x = x.clamp(-0.5, 1.5); }
+        if let Some(y) = p.pos_y { clip.pos_y = y.clamp(-0.5, 1.5); }
+        if let Some(s) = p.scale { clip.scale = s.clamp(0.05, 4.0); }
+        if let Some(s) = p.speed { clip.speed = s.clamp(0.25, 4.0); }
+        if let Some(f) = p.fade_in { clip.fade_in = f.clamp(0.0, 30.0); }
+        if let Some(f) = p.fade_out { clip.fade_out = f.clamp(0.0, 30.0); }
+        if let Some(d) = p.denoise { clip.denoise = d; }
+        if let Some(b) = p.brightness { clip.brightness = b.clamp(-1.0, 1.0); }
+        if let Some(c) = p.contrast { clip.contrast = c.clamp(0.0, 2.0); }
+        if let Some(s) = p.saturation { clip.saturation = s.clamp(0.0, 3.0); }
         Ok(clip.clone())
     }
+
+    /// Assign layout slots (position + scale) to clips, in order.
+    pub fn apply_layout(&mut self, clip_ids: &[String], layout: &str) -> Result<Vec<Clip>, String> {
+        let slots: Vec<(f32, f32, f32)> = match layout {
+            "fullscreen" => vec![(0.5, 0.5, 1.0)],
+            "pip-top-left" => vec![(0.5, 0.5, 1.0), (0.18, 0.18, 0.32)],
+            "pip-top-right" => vec![(0.5, 0.5, 1.0), (0.82, 0.18, 0.32)],
+            "pip-bottom-left" => vec![(0.5, 0.5, 1.0), (0.18, 0.82, 0.32)],
+            "pip-bottom-right" => vec![(0.5, 0.5, 1.0), (0.82, 0.82, 0.32)],
+            "side-by-side" => vec![(0.25, 0.5, 0.5), (0.75, 0.5, 0.5)],
+            "thirds" => vec![(0.1667, 0.5, 0.3333), (0.5, 0.5, 0.3333), (0.8333, 0.5, 0.3333)],
+            "grid-2x2" => vec![
+                (0.25, 0.25, 0.5), (0.75, 0.25, 0.5),
+                (0.25, 0.75, 0.5), (0.75, 0.75, 0.5),
+            ],
+            _ => return Err(format!(
+                "unknown layout {layout} (use fullscreen, pip-top-left, pip-top-right, pip-bottom-left, pip-bottom-right, side-by-side, thirds, grid-2x2)"
+            )),
+        };
+        if clip_ids.len() > slots.len() {
+            return Err(format!("layout {layout} has {} slots, got {} clips", slots.len(), clip_ids.len()));
+        }
+        let mut out = vec![];
+        for (id, (x, y, s)) in clip_ids.iter().zip(slots) {
+            let (ti, ci) = self
+                .find_clip_mut(id)
+                .ok_or_else(|| format!("clip {id} not found"))?;
+            let clip = &mut self.timeline.tracks[ti].clips[ci];
+            clip.pos_x = x;
+            clip.pos_y = y;
+            clip.scale = s;
+            out.push(clip.clone());
+        }
+        Ok(out)
+    }
+
+    /// Delete [start, end) across every track and close the gap (ripple).
+    pub fn ripple_delete_range(&mut self, start: i64, end: i64) -> Result<(), String> {
+        if end <= start {
+            return Err("end must be greater than start".into());
+        }
+        let len = end - start;
+        let fps = self.timeline.fps;
+        for track in &mut self.timeline.tracks {
+            let mut new_clips = vec![];
+            for mut clip in track.clips.drain(..) {
+                let speed = clip.speed as f64;
+                if clip.end_frame <= start {
+                    new_clips.push(clip); // fully before
+                } else if clip.start_frame >= end {
+                    clip.start_frame -= len; // fully after: shift left
+                    clip.end_frame -= len;
+                    new_clips.push(clip);
+                } else if clip.start_frame >= start && clip.end_frame <= end {
+                    // fully inside: dropped
+                } else if clip.start_frame < start && clip.end_frame > end {
+                    // spans the range: split into head + tail, tail shifts onto the cut
+                    let mut tail = clip.clone();
+                    tail.id = new_id();
+                    tail.source_in =
+                        clip.source_in + (end - clip.start_frame) as f64 / fps * speed;
+                    tail.start_frame = start;
+                    tail.end_frame = start + (clip.end_frame - end);
+                    clip.end_frame = start;
+                    new_clips.push(clip);
+                    new_clips.push(tail);
+                } else if clip.start_frame < start {
+                    clip.end_frame = start; // overlaps head of range
+                    new_clips.push(clip);
+                } else {
+                    // overlaps tail of range: trim front, shift onto the cut
+                    clip.source_in +=
+                        (end - clip.start_frame) as f64 / fps * speed;
+                    let dur = clip.end_frame - end;
+                    clip.start_frame = start;
+                    clip.end_frame = start + dur;
+                    new_clips.push(clip);
+                }
+            }
+            track.clips = new_clips;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+pub struct ClipProps {
+    pub volume: Option<f32>,
+    pub opacity: Option<f32>,
+    pub pos_x: Option<f32>,
+    pub pos_y: Option<f32>,
+    pub scale: Option<f32>,
+    pub speed: Option<f32>,
+    pub fade_in: Option<f32>,
+    pub fade_out: Option<f32>,
+    pub denoise: Option<bool>,
+    pub brightness: Option<f32>,
+    pub contrast: Option<f32>,
+    pub saturation: Option<f32>,
 }

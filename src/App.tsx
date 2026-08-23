@@ -6,12 +6,15 @@ import MediaBin from "./components/MediaBin";
 import Preview from "./components/Preview";
 import Timeline from "./components/Timeline";
 import ExportDialog from "./components/ExportDialog";
+import Inspector from "./components/Inspector";
 import type { Project } from "./types";
 import "./App.css";
 
 export default function App() {
-  const { project, refresh, setProject, setExportOpen, splitAtPlayhead, removeSelected, playing, setPlaying } =
-    useStore();
+  const {
+    project, refresh, setProject, setExportOpen, splitAtPlayhead,
+    removeSelected, playing, setPlaying, undo, redo,
+  } = useStore();
 
   useEffect(() => {
     refresh();
@@ -21,7 +24,11 @@ export default function App() {
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA") return;
-      if (e.key === " ") {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        if (e.shiftKey) redo();
+        else undo();
+      } else if (e.key === " ") {
         e.preventDefault();
         setPlaying(!playing);
       } else if (e.key === "Delete" || e.key === "Backspace") {
@@ -33,7 +40,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [playing, splitAtPlayhead, removeSelected, setPlaying]);
+  }, [playing, splitAtPlayhead, removeSelected, setPlaying, undo, redo]);
 
   const onNew = async () => {
     const p = await invoke<Project>("new_project");
@@ -93,6 +100,7 @@ export default function App() {
       <div className="main">
         <MediaBin />
         <Preview />
+        <Inspector />
       </div>
       <Timeline />
       <ExportDialog />

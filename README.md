@@ -15,19 +15,31 @@ Codex…) can edit alongside you — on a stack that runs on Windows:
 | AI control | MCP server | MCP server on `http://127.0.0.1:19790/mcp` |
 | License | GPLv3 (core) | GPLv3 |
 
-## Features (v0.1)
+## Features (v0.2)
 
-- Project management (`.palmierwin` JSON projects), New/Open/Save
+- Project management (`.palmierwin` JSON projects), New/Open/Save, **undo/redo**
+  (Ctrl/Cmd+Z, 100 levels)
 - Import video, audio and images (ffprobe metadata + thumbnails)
-- Multi-track timeline: drag, move across tracks, trim, razor split (S),
-  delete (Del), zoom (Ctrl+wheel), snapping playhead ruler
-- Clip properties: opacity (video), volume (audio)
-- Composited preview player (track 0 on top, like the original)
-- Export to H.264 / H.265 MP4 with AAC audio via FFmpeg `filter_complex`
-  (black canvas → scale/pad → overlay chain → amix), with live progress
-- **MCP server** with 11 tools: `get_project`, `import_media`, `add_track`,
+- Multi-track timeline: drag with **edge/playhead snapping**, move across
+  tracks, trim, razor split (S), delete (Del), zoom (Ctrl+wheel)
+- **Inspector panel**: transform (position/scale), layouts (**PIP, side by
+  side, thirds, 2×2 grid**), opacity, **brightness/contrast/saturation**,
+  **speed (0.25–4×)**, **fade in/out**, volume, **audio denoise**
+- **Text overlays** rendered with system fonts (outlined, multi-line,
+  lower-thirds)
+- **Remove silence**: FFmpeg silencedetect + ripple delete, one click
+- **Ripple delete ranges** across all tracks
+- Composited preview player honoring transforms, color, fades and speed
+- Export to H.264 / H.265 MP4 with AAC audio via FFmpeg `filter_complex`,
+  with live progress
+- **MCP server** with 18 tools: `get_project`, `import_media`, `add_track`,
   `add_clip`, `move_clip`, `trim_clip`, `split_clip`, `remove_clips`,
-  `set_clip_properties`, `set_timeline_settings`, `export_project`
+  `set_clip_properties`, `apply_layout`, `add_text`, `ripple_delete_ranges`,
+  `remove_silence`, `undo`, `redo`, `set_timeline_settings`, `export_project`
+
+Not yet (vs. Palmier Pro on macOS): transcription/captions & word-based cuts
+(needs Whisper), beat detection, multicam, nested/multiple timelines,
+keyframes, XML/FCPXML interchange, cloud generation.
 
 ## Requirements
 
